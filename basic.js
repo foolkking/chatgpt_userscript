@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         ChatGPT Message Helper
 // @namespace    https://chatgpt.com/
-// @version      1.1.60
+// @version      1.1.61
 // @description  Reliable message sending helpers for ChatGPT web UI changes.
 // @match        https://chatgpt.com/*
 // @grant        none
 // ==/UserScript==
 
 (function () {
-  const USERSCRIPT_VERSION = "1.1.60";
+  const USERSCRIPT_VERSION = "1.1.61";
   const IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 500;
   const IMAGE_DOWNLOAD_TIMEOUT_ERROR_MESSAGE = "Timed out waiting for a new visible generated image.";
   const IMAGE_RETRY_BUTTON_COUNT = 3;
@@ -50,6 +50,9 @@
   const DOWNLOAD_FILENAME_SESSION_POLL_MS = 500;
   const OUTPUT_DIRECTORY_PICKER_ID = "chatgpt-userscript-output";
   const OUTPUT_DIRECTORY_START_IN = "downloads";
+  const OUTPUT_DIRECTORY_UNSUPPORTED_ERROR_NAME = "OutputDirectoryUnsupportedError";
+  const BRAVE_FILE_SYSTEM_ACCESS_FLAG_URL = "brave://flags/#file-system-access-api";
+  const OUTPUT_DIRECTORY_FALLBACK_PROMPT_TIMEOUT_MS = 120000;
   const DEFAULT_IMAGE_DOWNLOAD_EXTENSION = ".png";
   const DOWNLOAD_IMAGE_EXTENSIONS = new Set([
     ".png",
@@ -2635,6 +2638,55 @@
     return error;
   }
 
+  function isOutputDirectoryPickerSupported() {
+    return typeof window.showDirectoryPicker === "function";
+  }
+
+  // Sync on purpose: the message can be built inside a click handler, and
+  // navigator.brave.isBrave() returns a promise that cannot be awaited there.
+  function isLikelyBraveBrowser() {
+    return Boolean(
+      typeof navigator !== "undefined" &&
+        navigator &&
+        navigator.brave &&
+        typeof navigator.brave.isBrave === "function"
+    );
+  }
+
+  function buildOutputDirectoryUnsupportedMessage() {
+    const lead =
+      "pick_output_dir=true requires showDirectoryPicker(), which is unavailable in this browser/context.";
+    if (isLikelyBraveBrowser()) {
+      return [
+        lead,
+        "",
+        "Brave disables the File System Access API by default. To use picked-folder output:",
+        `1. Open ${BRAVE_FILE_SYSTEM_ACCESS_FLAG_URL}`,
+        '2. Set "File System Access API" to Enabled',
+        "3. Restart Brave completely, then reload chatgpt.com"
+      ].join("\n");
+    }
+    return [
+      lead,
+      "",
+      "This browser does not support the File System Access API. Firefox and Safari have no equivalent setting to enable, so browser downloads are the only option there."
+    ].join("\n");
+  }
+
+  function createOutputDirectoryUnsupportedError(message) {
+    return createNamedError(OUTPUT_DIRECTORY_UNSUPPORTED_ERROR_NAME, message);
+  }
+
+  function isOutputDirectoryUnsupportedError(error) {
+    for (let current = error, depth = 0; current && typeof current === "object" && depth < 2; depth++) {
+      if (current.name === OUTPUT_DIRECTORY_UNSUPPORTED_ERROR_NAME) {
+        return true;
+      }
+      current = current.cause;
+    }
+    return false;
+  }
+
   function downloadBlobWithAnchor(blob, filename) {
     const safeFilename = buildSafeFilename(filename);
     const url = URL.createObjectURL(blob);
@@ -2715,10 +2767,8 @@
   }
 
   async function showOutputDirectoryPicker() {
-    if (typeof window.showDirectoryPicker !== "function") {
-      throw createOutputDirectoryError(
-        "pick_output_dir=true requires showDirectoryPicker(), which is unavailable in this browser/context."
-      );
+    if (!isOutputDirectoryPickerSupported()) {
+      throw createOutputDirectoryUnsupportedError(buildOutputDirectoryUnsupportedMessage());
     }
 
     try {
@@ -2755,7 +2805,8 @@
     );
   }
 
-  function createOutputDirectoryActivationPrompt() {
+  function createOutputDirectoryActivationPrompt(promptOptions) {
+    const promptText = isPlainObject(promptOptions) ? promptOptions : {};
     const overlay = document.createElement("div");
     overlay.setAttribute("role", "dialog");
     overlay.setAttribute("aria-modal", "true");
@@ -2779,14 +2830,16 @@
     panel.style.color = "#111827";
 
     const title = document.createElement("div");
-    title.textContent = "Choose output folder";
+    title.textContent = promptText.title ?? "Choose output folder";
     title.style.fontSize = "18px";
     title.style.fontWeight = "700";
     title.style.marginBottom = "8px";
 
     const message = document.createElement("div");
     message.textContent =
+      promptText.message ??
       "The browser requires a real click before opening the save-directory dialog. The helper is paused until you choose a folder.";
+    message.style.whiteSpace = "pre-line";
     message.style.fontSize = "14px";
     message.style.lineHeight = "1.45";
     message.style.marginBottom = "14px";
@@ -2805,7 +2858,7 @@
 
     const chooseButton = document.createElement("button");
     chooseButton.type = "button";
-    chooseButton.textContent = "Choose output folder";
+    chooseButton.textContent = promptText.confirmLabel ?? "Choose output folder";
     chooseButton.style.border = "0";
     chooseButton.style.borderRadius = "10px";
     chooseButton.style.padding = "10px 14px";
@@ -2816,7 +2869,7 @@
 
     const cancelButton = document.createElement("button");
     cancelButton.type = "button";
-    cancelButton.textContent = "Cancel";
+    cancelButton.textContent = promptText.cancelLabel ?? "Cancel";
     cancelButton.style.border = "1px solid #d1d5db";
     cancelButton.style.borderRadius = "10px";
     cancelButton.style.padding = "10px 14px";
@@ -2887,6 +2940,72 @@
     });
   }
 
+  // Resolves true to continue with browser downloads, false to cancel the run.
+  // timeoutMs > 0 auto-accepts downloads, so an unattended auto-resume cannot
+  // stall forever on a modal nobody is watching.
+  function waitForOutputDirectoryFallbackDecision(message, decisionOptions) {
+    const timeoutMs =
+      isPlainObject(decisionOptions) && Number.isFinite(decisionOptions.timeoutMs)
+        ? Math.max(0, Math.trunc(decisionOptions.timeoutMs))
+        : 0;
+
+    return new Promise((resolve) => {
+      const prompt = createOutputDirectoryActivationPrompt({
+        title: "Output folder unavailable",
+        message: `${message}\n\nContinue with regular browser downloads instead?`,
+        confirmLabel: "Use browser downloads",
+        cancelLabel: "Cancel run"
+      });
+      let settled = false;
+      let countdownTimer = null;
+
+      const cleanup = () => {
+        if (countdownTimer !== null) {
+          clearInterval(countdownTimer);
+          countdownTimer = null;
+        }
+        prompt.chooseButton.removeEventListener("click", onAccept);
+        prompt.cancelButton.removeEventListener("click", onDecline);
+        prompt.overlay.remove();
+      };
+
+      const settleWith = (value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(value);
+      };
+
+      const onAccept = () => settleWith(true);
+      const onDecline = () => settleWith(false);
+
+      prompt.chooseButton.addEventListener("click", onAccept);
+      prompt.cancelButton.addEventListener("click", onDecline);
+      document.body.appendChild(prompt.overlay);
+      prompt.chooseButton.focus();
+
+      if (timeoutMs > 0) {
+        let remainingMs = timeoutMs;
+        const renderCountdown = () => {
+          prompt.status.textContent = `Continuing with browser downloads in ${Math.ceil(
+            remainingMs / 1000
+          )}s...`;
+        };
+        renderCountdown();
+        countdownTimer = setInterval(() => {
+          remainingMs -= 1000;
+          if (remainingMs <= 0) {
+            settleWith(true);
+            return;
+          }
+          renderCountdown();
+        }, 1000);
+      }
+    });
+  }
+
   async function chooseOutputDirectoryHandle() {
     if (!isOutputDirectoryUserActivationKnown() || isOutputDirectoryUserActivationActive()) {
       try {
@@ -2909,6 +3028,9 @@
     try {
       baseDirectoryHandle = await chooseOutputDirectoryHandle();
     } catch (error) {
+      if (isOutputDirectoryUnsupportedError(error)) {
+        throw error;
+      }
       if (error && typeof error === "object" && error.name === "AbortError") {
         throw createOutputDirectoryError("Output directory selection was canceled.", error);
       }
@@ -3018,6 +3140,42 @@
     }
 
     return false;
+  }
+
+  // Never throws: callers get a decision, not an exception, so a missing
+  // showDirectoryPicker() cannot kill a run as an uncaught rejection.
+  // Idempotent by short-circuit -- once pickOutputDir is downgraded to false,
+  // nested callers ask nothing.
+  async function ensureOutputDirectorySupport(pickOutputDir, supportOptions) {
+    if (!pickOutputDir) {
+      return { ok: true, pickOutputDir: false, fallbackApplied: false, message: null };
+    }
+    if (isOutputDirectoryPickerSupported()) {
+      return { ok: true, pickOutputDir: true, fallbackApplied: false, message: null };
+    }
+
+    const message = buildOutputDirectoryUnsupportedMessage();
+    console.error(`[output] ${message}`);
+
+    let accepted = false;
+    try {
+      accepted = await waitForOutputDirectoryFallbackDecision(message, {
+        timeoutMs: isPlainObject(supportOptions) ? supportOptions.promptTimeoutMs : 0
+      });
+    } catch (error) {
+      console.error(`[output] Could not show the output fallback prompt: ${formatErrorForLog(error)}`);
+      return { ok: false, pickOutputDir: false, fallbackApplied: false, message };
+    }
+
+    if (!accepted) {
+      console.error("[output] Run canceled: no output folder available.");
+      return { ok: false, pickOutputDir: false, fallbackApplied: false, message };
+    }
+
+    console.warn(
+      "[output] pick_output_dir=true was requested, but the folder picker is unavailable; files will go to the browser download location."
+    );
+    return { ok: true, pickOutputDir: false, fallbackApplied: true, message };
   }
 
   async function resolveOutputTarget(pickOutputDir) {
@@ -4676,8 +4834,12 @@
       pick_output_dir,
       legacy_pick_output_dir
     );
+    const outputPreflight = await ensureOutputDirectorySupport(pickOutputDir);
+    if (!outputPreflight.ok) {
+      return;
+    }
     const outputTarget =
-      useNewChat && count > 0 ? await resolveOutputTarget(pickOutputDir) : null;
+      useNewChat && count > 0 ? await resolveOutputTarget(outputPreflight.pickOutputDir) : null;
 
     if (useNewChat && count > 0) {
       console.log("[new_chat_image] Opening a fresh chat before starting the run.");
@@ -5009,14 +5171,20 @@
     if (!config.useNewChat || !Array.isArray(config.selectedEntries) || config.selectedEntries.length === 0) {
       return null;
     }
-    if (config.pickOutputDir && config.outputDirectoryHandle) {
+    const outputPreflight = await ensureOutputDirectorySupport(Boolean(config.pickOutputDir), {
+      promptTimeoutMs: config.isAutoResume ? OUTPUT_DIRECTORY_FALLBACK_PROMPT_TIMEOUT_MS : 0
+    });
+    if (!outputPreflight.ok) {
+      throw createOutputDirectoryUnsupportedError(outputPreflight.message);
+    }
+    if (outputPreflight.pickOutputDir && config.outputDirectoryHandle) {
       try {
         return await createPickedOutputTargetFromHandle(config.outputDirectoryHandle);
       } catch (error) {
         console.warn(`[resume] Could not reuse saved output folder: ${formatErrorForLog(error)}. Asking again.`);
       }
     }
-    return resolveOutputTarget(Boolean(config.pickOutputDir));
+    return resolveOutputTarget(outputPreflight.pickOutputDir);
   }
 
   async function runPreparedArrayRun(config, resumeOptions) {
@@ -5071,7 +5239,8 @@
       ...config,
       selectedEntries,
       sendMode,
-      useNewChat
+      useNewChat,
+      isAutoResume
     });
     const runConfig = {
       ...config,
@@ -5083,6 +5252,11 @@
         outputTarget && outputTarget.directoryHandle
           ? outputTarget.directoryHandle
           : config.outputDirectoryHandle || null,
+      // Record what the run actually used, so a fell-back run does not re-ask on
+      // every resume. Continuous mode has no target; keep the request verbatim.
+      pickOutputDir: outputTarget
+        ? outputTarget.type === "picked_directory"
+        : Boolean(config.pickOutputDir),
       options
     };
 
@@ -5293,6 +5467,10 @@
       normalizedCallArgs.maybeLegacyPickOutputDir,
       normalizedCallArgs.options
     );
+    const outputPreflight = await ensureOutputDirectorySupport(normalizedArgs.pickOutputDir);
+    if (!outputPreflight.ok) {
+      return;
+    }
 
     const { messages, skippedCount } = normalizeMessageBatch(msgs, separator, normalizedArgs.options);
     if (skippedCount > 0) {
@@ -5335,7 +5513,7 @@
       postfixText,
       sendMode,
       useNewChat,
-      pickOutputDir: normalizedArgs.pickOutputDir,
+      pickOutputDir: outputPreflight.pickOutputDir,
       options: normalizedArgs.options
     });
   }
@@ -5460,14 +5638,6 @@
     legacy_pick_output_dir,
     options
   ) {
-    const promptFile = await chooseFileAsText();
-    const fileText = promptFile && typeof promptFile === "object" && "text" in promptFile
-      ? promptFile.text
-      : String(promptFile ?? "");
-    const promptSourceName =
-      promptFile && typeof promptFile === "object" && promptFile.fileName
-        ? String(promptFile.fileName)
-        : null;
     const normalizedCallArgs = normalizeArraySelectionCallArguments(
       selection,
       mode,
@@ -5481,6 +5651,21 @@
       normalizedCallArgs.maybeLegacyPickOutputDir,
       normalizedCallArgs.options
     );
+    // Checked before the prompt-file picker so an unusable output folder never
+    // wastes a file selection or a prepared run.
+    const outputPreflight = await ensureOutputDirectorySupport(normalizedArgs.pickOutputDir);
+    if (!outputPreflight.ok) {
+      return;
+    }
+
+    const promptFile = await chooseFileAsText();
+    const fileText = promptFile && typeof promptFile === "object" && "text" in promptFile
+      ? promptFile.text
+      : String(promptFile ?? "");
+    const promptSourceName =
+      promptFile && typeof promptFile === "object" && promptFile.fileName
+        ? String(promptFile.fileName)
+        : null;
     await sendMessageRepeatedlyArray(
       fileText,
       sleep,
@@ -5489,7 +5674,7 @@
       postfix,
       normalizedCallArgs.selection,
       sendMode,
-      normalizedArgs.pickOutputDir,
+      outputPreflight.pickOutputDir,
       {
         ...normalizedArgs.options,
         continueOnImageDownloadTimeout: sendMode === SEND_MODES.NEW_CHAT_IMAGE,
@@ -5505,7 +5690,11 @@
       pick_output_dir,
       legacy_pick_output_dir
     );
-    const outputTarget = await resolveOutputTarget(pickOutputDir);
+    const outputPreflight = await ensureOutputDirectorySupport(pickOutputDir);
+    if (!outputPreflight.ok) {
+      return;
+    }
+    const outputTarget = await resolveOutputTarget(outputPreflight.pickOutputDir);
     return clickDownloadButtons(getDownloadButtons(), undefined, {
       outputTarget
     });
@@ -5579,7 +5768,17 @@
     }
 
     addAutoResumeHash(record.resumeJobId || null);
-    return resumeArrayRunFromRecord(record, "manual_chat_resume");
+    try {
+      return await resumeArrayRunFromRecord(record, "manual_chat_resume");
+    } catch (error) {
+      if (isOutputDirectoryUnsupportedError(error)) {
+        return {
+          ok: false,
+          reason: "output_directory_unsupported"
+        };
+      }
+      throw error;
+    }
   }
 
   async function autoResumeArrayRunOnStartup() {
