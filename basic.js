@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         ChatGPT Message Helper
 // @namespace    https://chatgpt.com/
-// @version      1.1.61
+// @version      1.1.62
 // @description  Reliable message sending helpers for ChatGPT web UI changes.
 // @match        https://chatgpt.com/*
 // @grant        none
 // ==/UserScript==
 
 (function () {
-  const USERSCRIPT_VERSION = "1.1.61";
+  const USERSCRIPT_VERSION = "1.1.62";
   const IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 500;
   const IMAGE_DOWNLOAD_TIMEOUT_ERROR_MESSAGE = "Timed out waiting for a new visible generated image.";
   const IMAGE_RETRY_BUTTON_COUNT = 3;
@@ -2952,10 +2952,18 @@
     return new Promise((resolve) => {
       const prompt = createOutputDirectoryActivationPrompt({
         title: "Output folder unavailable",
-        message: `${message}\n\nContinue with regular browser downloads instead?`,
-        confirmLabel: "Use browser downloads",
+        message: `${message}\n\nContinue without a picked folder?`,
+        confirmLabel: "Use this Browser's default Downloads directory (typically ~/Downloads)",
         cancelLabel: "Cancel run"
       });
+      // The confirm label is long: let it shrink and wrap inside the button so
+      // both actions stay on one row instead of Cancel jumping above it.
+      prompt.chooseButton.style.whiteSpace = "normal";
+      prompt.chooseButton.style.textAlign = "left";
+      prompt.chooseButton.style.lineHeight = "1.35";
+      prompt.chooseButton.style.flex = "1 1 auto";
+      prompt.chooseButton.style.minWidth = "0";
+      prompt.cancelButton.style.flex = "0 0 auto";
       let settled = false;
       let countdownTimer = null;
 
