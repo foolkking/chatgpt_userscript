@@ -71,3 +71,14 @@ that job's record; `clearState()` clears the whole resume store.
 For `pick_output_dir=true`, the script tries to store the File System Access
 directory handle in IndexedDB. If the browser cannot clone the handle or the
 permission is gone after reload, the resumed run asks for the output folder again.
+
+The record stores the *effective* output mode, not the requested one. A run that
+fell back to browser downloads resumes as browser downloads without asking again.
+
+Output-folder support is re-checked on resume before any saved handle is reused,
+because a persisted handle is unusable in a browser without the File System
+Access API and would otherwise only fail at the first image write, mid-run. If a
+`pick_output_dir` record is restored where the API is unavailable (for example
+after the Brave flag was turned off), the resumed run shows the same
+`Output folder unavailable` dialog. During auto-resume that dialog counts down
+and auto-accepts browser downloads, so an unattended run cannot stall on it.

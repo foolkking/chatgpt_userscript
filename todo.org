@@ -48,3 +48,9 @@ await in sendMessageRepeatedlyArrayChooseFile
 
 * DONE CREATIVE_LICENSE_RETRY_PROMPT should become an array of prompts to be sent (no  image -> send next prompt), and it should end with "Generate!".
 
+* DONE =pick_output_dir=true= failed with an uncaught rejection on Brave (=showDirectoryPicker()= unavailable)
+Brave disables the File System Access API by default, behind
+=brave://flags/#file-system-access-api=. Enabling that flag and restarting Brave
+makes picked-folder output work. The script now checks support before the
+prompt-file picker, names the Brave flag in the error, and offers browser
+downloads or a clean cancel instead of losing a prepared run.
